@@ -1,0 +1,149 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+	xmlns:batch="http://www.springframework.org/schema/batch"
+	xmlns:jdbc="http://www.springframework.org/schema/jdbc" 
+	xmlns:int="http://www.springframework.org/schema/integration"
+	xmlns:task="http://www.springframework.org/schema/task" 
+	xmlns:jms="http://www.springframework.org/schema/jms"
+	xmlns:int-jms="http://www.springframework.org/schema/integration/jms"
+	xmlns:int-stream="http://www.springframework.org/schema/integration/stream"
+	xsi:schemaLocation="http://www.springframework.org/schema/jdbc http://www.springframework.org/schema/jdbc/spring-jdbc-3.0.xsd                  http://www.springframework.org/schema/jms http://www.springframework.org/schema/jms/spring-jms-3.0.xsd                  http://www.springframework.org/schema/integration http://www.springframework.org/schema/integration/spring-integration-1.0.xsd                  http://www.springframework.org/schema/integration/jms http://www.springframework.org/schema/integration/jms/spring-integration-jms-2.0.xsd                  http://www.springframework.org/schema/task http://www.springframework.org/schema/task/spring-task-3.0.xsd                  http://www.springframework.org/schema/integration/stream http://www.springframework.org/schema/integration/stream/spring-integration-stream-2.0.xsd                  http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-3.0.xsd                  http://www.springframework.org/schema/batch http://www.springframework.org/schema/batch/spring-batch-2.1.xsd">
+	<job id="jobSimple" xmlns="http://www.springframework.org/schema/batch">
+		<step id="stepSimple">
+			<tasklet>
+				<chunk reader="reader" writer="writer" commit-interval="10" />
+			</tasklet>
+		</step>
+	</job>
+	<job id="jobRemoteChunk" xmlns="http://www.springframework.org/schema/batch">
+		<step id="stepRemoteChunk">
+			<tasklet>
+				<chunk reader="reader" writer="writer" commit-interval="10" />
+			</tasklet>
+		</step>
+	</job>
+	<bean id="reader"
+		class="org.springframework.batch.item.database.JdbcPagingItemReader"
+		scope="step">
+		<property name="dataSource" ref="dataSource" />
+		<property name="queryProvider">
+			<bean
+				class="org.springframework.batch.item.database.support.SqlPagingQueryProviderFactoryBean">
+				<property name="dataSource" ref="dataSource" />
+				<property name="selectClause" value="select id,name,description,price" />
+				<property name="fromClause" value="from staging_product" />
+				<property name="sortKey" value="id" />
+			</bean>
+		</property>
+		<property name="pageSize" value="10" />
+		<property name="rowMapper">
+			<bean class="com.manning.sbia.sandbox.ProductRowMapper" />
+		</property>
+	</bean>
+	<bean id="writer" class="com.manning.sbia.sandbox.chunk.StagingProductItemWriter">
+		<constructor-arg ref="dataSource" />
+	</bean>
+	<bean id="chunkWriter"
+		class="org.springframework.batch.integration.chunk.ChunkMessageChannelItemWriter"
+		scope="step">
+		<property name="messagingGateway" ref="messagingGateway" />
+	</bean>
+	<bean id="messagingGateway"
+		class="org.springframework.integration.gateway.SimpleMessagingGateway">
+		<property name="requestChannel" ref="requests" />
+		<property name="replyChannel" ref="replies" />
+		<property name="replyTimeout" value="1000" />
+	</bean>
+	<int-jms:outbound-channel-adapter
+		connection-factory="connectionFactory" channel="requests"
+		destination-name="requests" />
+	<int:channel id="requests" />
+	<int:channel id="incoming" />
+	<int:transformer input-channel="incoming"
+		output-channel="replies" ref="headerExtractor" method="extract" />
+	<int:thread-local-channel id="replies">
+		<int:interceptors>
+			<bean id="pollerInterceptor"
+				class="org.springframework.batch.integration.chunk.MessageSourcePollerInterceptor">
+				<property name="messageSource">
+					<bean
+						class="org.springframework.integration.jms.JmsDestinationPollingSource">
+						<constructor-arg>
+							<bean class="org.springframework.jms.core.JmsTemplate">
+								<property name="connectionFactory" ref="connectionFactory" />
+								<property name="defaultDestinationName" value="replies" />
+								<property name="receiveTimeout" value="100" />
+							</bean>
+						</constructor-arg>
+					</bean>
+				</property>
+				<property name="channel" ref="incoming" />
+			</bean>
+		</int:interceptors>
+	</int:thread-local-channel>
+	<bean id="headerExtractor"
+		class="org.springframework.batch.integration.chunk.JmsRedeliveredExtractor" />
+	<jms:listener-container connection-factory="connectionFactory"
+		transaction-manager="transactionManager" acknowledge="transacted"
+		concurrency="1">
+		<jms:listener destination="requests"
+			response-destination="replies" ref="chunkHandler" method="handleChunk" />
+	</jms:listener-container>
+	<bean id="chunkHandler"
+		class="org.springframework.batch.integration.chunk.RemoteChunkHandlerFactoryBean">
+		<property name="chunkWriter" ref="chunkWriter" />
+		<property name="step" ref="stepRemoteChunk" />
+	</bean>
+	<bean id="transactionManager"
+		class="org.springframework.jdbc.datasource.DataSourceTransactionManager">
+		<property name="dataSource" ref="dataSource" />
+	</bean>
+	<batch:job-repository />
+	<bean id="jobLauncher"
+		class="org.springframework.batch.core.launch.support.SimpleJobLauncher">
+		<property name="jobRepository" ref="jobRepository" />
+	</bean>
+	<bean id="dataSource" class="org.apache.commons.dbcp.BasicDataSource">
+		<property name="driverClassName" value="org.h2.Driver" />
+		<property name="url"
+			value="jdbc:h2:mem:sbia_sandbox_remote_chunk_jms;DB_CLOSE_DELAY=-1" />
+		<property name="username" value="sa" />
+		<property name="password" value="" />
+		<property name="initialSize" value="5" />
+		<property name="maxActive" value="5" />
+	</bean>
+	<jdbc:initialize-database data-source="dataSource">
+		<jdbc:script location="classpath:/org/springframework/batch/core/schema-h2.sql" />
+		<jdbc:script location="classpath:/create-tables.sql" />
+		<jdbc:script
+			location="classpath:/com/manning/sbia/sandbox/chunk/create-staging-tables.sql" />
+	</jdbc:initialize-database>
+	<bean class="org.springframework.jdbc.core.JdbcTemplate">
+		<constructor-arg ref="dataSource" />
+	</bean>
+	<bean id="jmsTemplate" class="org.springframework.jms.core.JmsTemplate">
+		<property name="connectionFactory" ref="connectionFactory" />
+		<property name="receiveTimeout" value="100" />
+		<property name="sessionTransacted" value="true" />
+	</bean>
+	<bean id="connectionFactory" class="org.apache.activemq.ActiveMQConnectionFactory"
+		depends-on="brokerService">
+		<property name="brokerURL">
+			<value>vm://localhost</value>
+		</property>
+	</bean>
+	<bean id="brokerService" class="org.apache.activemq.broker.BrokerService"
+		init-method="start" destroy-method="stop">
+		<property name="brokerName" value="localhost" />
+		<property name="useJmx" value="false" />
+		<property name="transportConnectorURIs">
+			<list>
+				<value>vm://localhost</value>
+			</list>
+		</property>
+		<property name="persistenceAdapter">
+			<bean class="org.apache.activemq.store.memory.MemoryPersistenceAdapter" />
+		</property>
+	</bean>
+</beans> 
